@@ -210,6 +210,12 @@ def build_disconnect() -> bytes:
     return _encode_field_len(6, b"")
 
 
+def build_log_message(text: str) -> bytes:
+    """Message { log: Log { text } } — field 4, Log.text = field 1"""
+    inner = _encode_field_len(1, text.encode("utf-8"))
+    return _encode_field_len(4, inner)
+
+
 def parse_outer_message(data: bytes) -> dict:
     """Returns the outer Message as a dict."""
     return _parse_message(data)
@@ -460,6 +466,20 @@ class Bridge:
         client.connect(host, port, keepalive=30)
         return client
 
+    def _send_log(self, text: str):
+        """Fire-and-forget: send a log message to the relay app's remote log."""
+        if not self._relay_id or not self._relay_client:
+            return
+        try:
+            msg = build_log_message(text)
+            encrypted = encrypt_message(self._relay_id, msg)
+            write_topic = topic_to_relay(self._relay_client_id)
+            props = mqtt.Properties(mqtt.PacketTypes.PUBLISH)
+            props.ContentType = "application/proto"
+            self._relay_client.publish(write_topic, encrypted, qos=1, properties=props)
+        except Exception as e:
+            log.debug(f"_send_log failed: {e}")
+
     # ── Discovery phase ───────────────────────────────────────────────────────
 
     def _disc_on_connect(self, client, userdata, flags, rc, properties=None):
@@ -618,6 +638,8 @@ class Bridge:
         log.info(f"Relay info confirmed: {info}")
         self._relay_info_received = True
         self._session_active = True
+        uid = info.get("uid", "unknown")
+        self._send_log(f"Bridge ready — card UID: {uid}")
         # Now start the vpcd bridge
         threading.Thread(target=self._vpcd_loop, daemon=True).start()
 
@@ -680,10 +702,12 @@ class Bridge:
                 conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 conn.connect((self.vpcd_host, self.vpcd_port))
                 log.info("Connected to BixVReader successfully")
+                self._send_log("PC/SC tool connected")
                 log.info("CARD READY — run GPP now:")
                 log.info("  gp -r Vir --list -F")
                 self._handle_vpcd_connection(conn)
                 log.info("BixVReader session ended")
+                self._send_log("PC/SC session ended")
             except ConnectionRefusedError:
                 log.warning("BixVReader not ready on port %d, retrying in 1s...", self.vpcd_port)
                 time.sleep(1)
