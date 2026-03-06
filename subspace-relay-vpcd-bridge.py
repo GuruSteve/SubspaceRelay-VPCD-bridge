@@ -391,6 +391,19 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes | None:
     return buf
 
 
+# ── MQTT error helper ─────────────────────────────────────────────────────────
+
+def _handle_mqtt_connect_error(rc, label: str):
+    """Log a connect failure; exit immediately for authentication errors."""
+    val = rc.value if hasattr(rc, "value") else int(rc)
+    reason = str(rc)
+    # MQTTv5: 134=Bad User Name or Password, 135=Not Authorized
+    # MQTTv3: 4=Refused bad credentials,    5=Refused not authorized
+    if val in (134, 135, 4, 5):
+        sys.exit(f"{label} MQTT authentication failed — check broker username/password: {reason}")
+    log.error(f"{label} MQTT connection failed: {reason}")
+
+
 # ── Bridge state machine ──────────────────────────────────────────────────────
 
 class Bridge:
@@ -416,6 +429,7 @@ class Bridge:
         self._correlation_map: dict[bytes, threading.Event] = {}
         self._correlation_rapdu: dict[bytes, bytes] = {}
         self._lock = threading.Lock()
+        self._vpcd_lock = threading.Lock()  # prevents duplicate vpcd loop starts
 
         # Discovery MQTT connection (uses dummy relay_id "discovery")
         self._disc_client = self._make_mqtt_client("discovery", is_discovery=True)
@@ -483,6 +497,9 @@ class Bridge:
     # ── Discovery phase ───────────────────────────────────────────────────────
 
     def _disc_on_connect(self, client, userdata, flags, rc, properties=None):
+        if rc != 0:
+            _handle_mqtt_connect_error(rc, "Discovery")
+            return
         log.info("Discovery MQTT connected")
         client.subscribe(TOPIC_BROADCAST_FROM_RELAY, qos=1)
         # Broadcast messages are raw protobuf — NO encryption
@@ -556,6 +573,9 @@ class Bridge:
         self._send_rpc(build_request_relay_info(), callback=self._handle_relay_info)
 
     def _relay_on_connect(self, client, userdata, flags, rc, properties=None):
+        if rc != 0:
+            _handle_mqtt_connect_error(rc, "Relay")
+            return
         log.info("Relay MQTT connected")
         read_topic = topic_from_relay(self._relay_client_id)
         client.subscribe(read_topic, qos=2)
@@ -693,27 +713,51 @@ class Bridge:
         Connect TO BixVReader (RPC_TYPE=2 mode).
         BixVReader.ini must have RPC_TYPE=2, TCP_PORT=35963
         """
+        # Within-process guard: only one vpcd loop may run at a time.
+        if not self._vpcd_lock.acquire(blocking=False):
+            log.warning("vpcd loop already running — ignoring duplicate start")
+            return
+
+        # Cross-process guard: bind a sentinel port so a second bridge process
+        # will detect an active connection and refuse to start.
+        guard_port = self.vpcd_port - 1
+        guard_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            guard_sock.bind(("127.0.0.1", guard_port))
+        except OSError:
+            log.error(
+                f"Another bridge process is already connected to BixVReader "
+                f"(sentinel port {guard_port} is taken). Only one bridge may connect at a time."
+            )
+            guard_sock.close()
+            self._vpcd_lock.release()
+            return
+
         log.info(f"Connecting to BixVReader on {self.vpcd_host}:{self.vpcd_port}")
         log.info("Then run GlobalPlatformPro: gp -reader \"Virtual PCD 0\" <flags>")
 
-        while self._session_active:
-            try:
-                conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                conn.connect((self.vpcd_host, self.vpcd_port))
-                log.info("Connected to BixVReader successfully")
-                self._send_log("PC/SC tool connected")
-                log.info("CARD READY — run GPP now:")
-                log.info("  gp -r Vir --list -F")
-                self._handle_vpcd_connection(conn)
-                log.info("BixVReader session ended")
-                self._send_log("PC/SC session ended")
-            except ConnectionRefusedError:
-                log.warning("BixVReader not ready on port %d, retrying in 1s...", self.vpcd_port)
-                time.sleep(1)
-            except OSError as e:
-                log.warning(f"vpcd connection error: {e}, retrying in 1s...")
-                time.sleep(1)
+        try:
+            while self._session_active:
+                try:
+                    conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    conn.connect((self.vpcd_host, self.vpcd_port))
+                    log.info("Connected to BixVReader successfully")
+                    self._send_log("PC/SC tool connected")
+                    log.info("CARD READY — run GPP now:")
+                    log.info("  gp -r Vir --list -F")
+                    self._handle_vpcd_connection(conn)
+                    log.info("BixVReader session ended")
+                    self._send_log("PC/SC session ended")
+                except ConnectionRefusedError:
+                    log.warning("BixVReader not ready on port %d, retrying in 1s...", self.vpcd_port)
+                    time.sleep(1)
+                except OSError as e:
+                    log.warning(f"vpcd connection error: {e}, retrying in 1s...")
+                    time.sleep(1)
+        finally:
+            guard_sock.close()
+            self._vpcd_lock.release()
 
     def _handle_vpcd_connection(self, conn: socket.socket):
         """
